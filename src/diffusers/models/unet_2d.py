@@ -24,6 +24,47 @@ from .embeddings import GaussianFourierProjection, TimestepEmbedding, Timesteps
 from .unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
 
 
+class TemporalGraphConvolution(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(TemporalGraphConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.Tensor(in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.constant_(self.bias, 0)
+
+    def forward(self, input, adjacency_matrix):
+        support = torch.mm(input, self.weight)
+        if self.bias is not None:
+            support = support + self.bias
+        output = torch.mm(support, adjacency_matrix)
+        
+        return output
+
+
+# class TemporalGraphConvolutionalNetwork(nn.Module):
+#     def __init__(self, in_features, bias=True):
+#         super(TemporalGraphConvolutionalNetwork, self).__init__()
+#         self.layers = nn.ModuleList()
+#         hidden_features = in_features
+#         self.gcn = TemporalGraphConvolution(in_features, hidden_features, bias)
+#         # self.linear = nn.Linear(hidden_features, out_features)
+
+#     def forward(self, input, adjacency_matrix):
+#         input = self.gcn(input, adjacency_matrix)
+#         # input = self.linear(input)
+
+#         return input
+
+
 @dataclass
 class UNet2DOutput(BaseOutput):
     """
@@ -94,6 +135,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         norm_eps: float = 1e-5,
         resnet_time_scale_shift: str = "default",
         add_attention: bool = True,
+        ddpm_num_steps: int = 1000,
     ):
         super().__init__()
 
@@ -101,16 +143,31 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         time_embed_dim = block_out_channels[0] * 4
 
         # input
+        self.time_embedding_type = time_embedding_type
+        self.ddpm_num_steps = ddpm_num_steps
         self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
 
         # time
         if time_embedding_type == "fourier":
+            # self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
             self.time_proj = GaussianFourierProjection(embedding_size=block_out_channels[0], scale=16)
             timestep_input_dim = 2 * block_out_channels[0]
+            
         elif time_embedding_type == "positional":
+            # self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
             self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
             timestep_input_dim = block_out_channels[0]
-
+            # self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
+            
+        elif time_embedding_type == "graph":
+            
+            self.time_proj = TemporalGraphConvolution(1, ddpm_num_steps)
+            timestep_input_dim = ddpm_num_steps
+            self.adj_matrix = self.create_adjacency_matrix(ddpm_num_steps)
+            # self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
+            # self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
+        
+        
         self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
 
         self.down_blocks = nn.ModuleList([])
@@ -186,6 +243,16 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         self.conv_act = nn.SiLU()
         self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 
+    def create_adjacency_matrix(self, n: int):
+        # create an n x n matrix of zeros
+        adjacency_matrix = torch.zeros(n, n, requires_grad=False)
+        
+        # set the values in the upper triangle to 1
+        for i in range(1, n):
+            adjacency_matrix[i, i-1] = 1
+        
+        return adjacency_matrix
+
     def forward(
         self,
         sample: torch.FloatTensor,
@@ -217,7 +284,15 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timesteps = timesteps * torch.ones(sample.shape[0], dtype=timesteps.dtype, device=timesteps.device)
 
-        t_emb = self.time_proj(timesteps)
+        if self.time_embedding_type == "graph":
+            # timesteps_ohe = nn.functional.one_hot(timesteps, num_classes=self.ddpm_num_steps)
+            timesteps_ohe = (timesteps/self.ddpm_num_steps).unsqueeze(-1)
+            # print(timesteps_ohe)
+            # timesteps_ohe = timesteps_ohe.
+            # print("sample device", sample.device)
+            t_emb = self.time_proj(timesteps_ohe.type(dtype=torch.FloatTensor).to(sample.device), self.adj_matrix.to(sample.device))
+        else:        
+            t_emb = self.time_proj(timesteps)
 
         # timesteps does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
@@ -227,8 +302,8 @@ class UNet2DModel(ModelMixin, ConfigMixin):
 
         # 2. pre-process
         skip_sample = sample
+        # if self.time_embedding_type != "graph":
         sample = self.conv_in(sample)
-
         # 3. down
         down_block_res_samples = (sample,)
         for downsample_block in self.down_blocks:
