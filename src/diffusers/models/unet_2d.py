@@ -45,7 +45,8 @@ class TemporalGraphConvolution(nn.Module):
         support = torch.mm(input, self.weight)
         if self.bias is not None:
             support = support + self.bias
-        output = torch.mm(support, adjacency_matrix)
+        # output = torch.mm(support, adjacency_matrix)
+        output = torch.matmul(adjacency_matrix, support.T).T
         
         return output
 

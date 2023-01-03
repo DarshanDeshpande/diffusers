@@ -261,6 +261,7 @@ def main(args):
         log_with=args.logger,
         logging_dir=logging_dir,
     )
+    print("Device: ", accelerator.device)
 
     model = UNet2DModel(
         sample_size=args.resolution,
@@ -284,6 +285,9 @@ def main(args):
             "UpBlock2D",
             "UpBlock2D",
         ),
+        ddpm_num_steps=args.ddpm_num_steps,
+        time_embedding_type="graph",
+
     )
     accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
 
